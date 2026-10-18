@@ -1,0 +1,54 @@
+# 本仓库是「代码备份」，原则是宁多勿少：
+# 只忽略确实能再生/缓存/本机隐私的东西，不按扩展名一刀切
+# （早期版本误用 *.bin 排除了智控台的字体资产，已修正）。
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ---- 服务器运行产物 ----
+xiaozhi-esp32-server/main/xiaozhi-server/tmp/
+xiaozhi-esp32-server/main/xiaozhi-server/data/.config.yaml
+*.log
+logs/
+
+# ---- Java / Maven ----
+target/
+
+# ---- Node / 前端 ----
+node_modules/
+dist/
+.vite/
+
+# ---- Flutter / Dart ----
+.dart_tool/
+.packages
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+*.iml
+ios/Pods/
+
+# ---- ESP-IDF 构建产物 ----
+xiaozhi-esp32-main/build/
+sdkconfig.old
+managed_components/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+__MACOSX/
+
+# ---- 本机隐私 ----
+.env
+*.secret
+
+# 脱敏用的密钥清单（本机才有，绝不提交）
+.sanitize_secrets

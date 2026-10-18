@@ -1,0 +1,555 @@
+﻿diff --git a/FlutterClient/active/source-code/lib/screens/chat_screen.dart b/FlutterClient/active/source-code/lib/screens/chat_screen.dart
+index 206605b..a2f2eb4 100644
+--- a/FlutterClient/active/source-code/lib/screens/chat_screen.dart
++++ b/FlutterClient/active/source-code/lib/screens/chat_screen.dart
+@@ -271,7 +271,16 @@ class _ChatScreenState extends State<ChatScreen> {
+       'hass_set_state': '🏠 正在控制设备...',
+     };
+ 
+-    return toolNameMap[toolName] ?? '⚙️ 正在调用 $toolName...';
++    // 命中已知工具名就换成固定提示；否则说明服务端已经给了人话
++    // （如"让我查一下资料…"），直接用，不要拼成"正在调用 xxx"。
++    final mapped = toolNameMap[toolName];
++    if (mapped != null) {
++      return mapped;
++    }
++    if (RegExp(r'[\u4e00-\u9fa5]').hasMatch(toolName)) {
++      return toolName;
++    }
++    return '⚙️ 正在调用 $toolName...';
+   }
+ 
+   // 初始化 DifyService
+diff --git a/FlutterClient/active/source-code/lib/services/xiaozhi_service.dart b/FlutterClient/active/source-code/lib/services/xiaozhi_service.dart
+index d576316..01c5f49 100644
+--- a/FlutterClient/active/source-code/lib/services/xiaozhi_service.dart
++++ b/FlutterClient/active/source-code/lib/services/xiaozhi_service.dart
+@@ -629,11 +629,26 @@ class XiaozhiService {
+           }
+           break;
+ 
++        case 'tool':
++          // 工具调用状态（服务端已改为独立 tool 类型，不再占用 stt 通道）
++          // 服务端会带一句人话 text（如"让我查一下资料…"），有就优先显示它，
++          // 没有才退回工具名，由界面层做名称映射。
++          final String toolName = jsonData['name'] ?? '';
++          final String toolText = (jsonData['text'] ?? '').toString().trim();
++          final String payload = toolText.isNotEmpty ? toolText : toolName;
++          if (payload.isNotEmpty) {
++            print('$TAG: 收到工具调用状态: $toolName -> $payload');
++            _dispatchEvent(
++              XiaozhiServiceEvent(XiaozhiServiceEventType.toolCall, payload),
++            );
++          }
++          break;
++
+         case 'stt':
+           // 处理语音识别结果或工具调用状态
+           final String text = jsonData['text'] ?? '';
+           if (text.isNotEmpty) {
+-            // 区分工具调用状态（以 "% " 开头）和普通语音识别结果
++            // 兼容旧版服务端：工具调用状态以 "% " 开头
+             if (text.startsWith('% ')) {
+               final toolName = text.substring(2).trim();
+               print('$TAG: 收到工具调用状态: $toolName');
+diff --git a/xiaozhi-esp32-main/main/application.cc b/xiaozhi-esp32-main/main/application.cc
+index a1fd975..b630f11 100644
+--- a/xiaozhi-esp32-main/main/application.cc
++++ b/xiaozhi-esp32-main/main/application.cc
+@@ -551,10 +551,36 @@ void Application::InitializeProtocol() {
+         } else if (strcmp(type->valuestring, "stt") == 0) {
+             auto text = cJSON_GetObjectItem(root, "text");
+             if (cJSON_IsString(text)) {
+-                ESP_LOGI(TAG, ">> %s", text->valuestring);
+-                Schedule([display, message = std::string(text->valuestring)]() {
+-                    display->SetChatMessage("user", message.c_str());
+-                    });
++                const char* raw = text->valuestring;
++                // 以 "% " 开头的是服务端旧版的工具调用状态（例如
++                // "% search_from_ragflow"），不是学生说的话，不能刷到字幕上。
++                if (raw != nullptr && raw[0] == '%' &&
++                    (raw[1] == ' ' || raw[1] == '\0')) {
++                    ESP_LOGD(TAG, "Ignore tool status message: %s", raw);
++                } else {
++                    ESP_LOGI(TAG, ">> %s", raw);
++                    Schedule([display, msg = std::string(raw)]() {
++                        display->SetChatMessage("user", msg.c_str());
++                        });
++                }
++            }
++        } else if (strcmp(type->valuestring, "tool") == 0) {
++            // 工具调用状态：独立消息类型，不进字幕。
++            // 服务端会带一句人话 text（如"让我查一下资料…"），显示在顶部状态栏，
++            // 学生看到的是"思考中"，而不是 search_from_ragflow 这种内部名字。
++            auto name = cJSON_GetObjectItem(root, "name");
++            auto state = cJSON_GetObjectItem(root, "state");
++            auto text = cJSON_GetObjectItem(root, "text");
++            if (cJSON_IsString(name)) {
++                ESP_LOGI(TAG, "tool %s: %s",
++                         cJSON_IsString(state) ? state->valuestring : "?",
++                         name->valuestring);
++            }
++            if (cJSON_IsString(text) && text->valuestring[0] != '\0' &&
++                cJSON_IsString(state) && strcmp(state->valuestring, "start") == 0) {
++                Schedule([display, msg = std::string(text->valuestring)]() {
++                    display->SetStatus(msg.c_str());
++                });
+             }
+         } else if (strcmp(type->valuestring, "llm") == 0) {
+             auto emotion = cJSON_GetObjectItem(root, "emotion");
+diff --git a/xiaozhi-esp32-server/main/xiaozhi-server/core/connection.py b/xiaozhi-esp32-server/main/xiaozhi-server/core/connection.py
+index 76736a7..04ca1f4 100644
+--- a/xiaozhi-esp32-server/main/xiaozhi-server/core/connection.py
++++ b/xiaozhi-esp32-server/main/xiaozhi-server/core/connection.py
+@@ -81,6 +81,31 @@ TOOL_CALLING_RULES = """
+ auto_import_modules("plugins_func.functions")
+ 
+ 
++def classify_stream_prefix(pending: str, marker: str, holdback_chars: int) -> str:
++    """判断流式输出开头是工具调用文本还是正常回答。
++
++    本地模型（如 Ollama 上的 GLM）不支持原生 function call 时，会按提示词
++    输出 `<tool_call>{"name": ...}</tool_call>` 这种纯文本。这段文本一旦进了
++    TTS 队列，就会既被念出来又显示在设备字幕上（学生看到的
++    “search_from_ragflow”就是这么漏出去的）。
++
++    返回：
++        "tool"  —— 已确认是工具调用文本，不能播报
++        "plain" —— 已确认是正常回答，可以放行
++        "wait"  —— 还看不出来（标记可能被拆成多个 chunk），先压着别播
++    """
++    stripped = pending.lstrip()
++    if stripped.startswith(marker):
++        return "tool"
++    # 已收到的内容不是标记的前缀 → 一定是正常回答
++    if not marker.startswith(stripped[: len(marker)]):
++        return "plain"
++    # 压着的字数足够多了，不再等（避免极端情况一直不播）
++    if len(pending) >= holdback_chars:
++        return "plain"
++    return "wait"
++
++
+ class TTSException(RuntimeError):
+     pass
+ 
+@@ -911,6 +936,13 @@ class ConnectionHandler:
+             current_sentence_id = str(uuid.uuid4().hex)
+             self.sentence_id = current_sentence_id  # 更新共享属性
+             self.dialogue.put(Message(role="user", content=query))
++            # 先亮一个"思考中"表情：学生说完到第一句回答之间有检索+首token 的等待，
++            # 这段时间屏幕不动会显得很卡。回答开始后会被 get_emotion 的正式情绪覆盖。
++            if query is not None and self.config.get("enable_thinking_indicator", True):
++                asyncio.run_coroutine_threadsafe(
++                    textUtils.send_thinking(self),
++                    self.loop,
++                )
+             self.tts.tts_text_queue.put(
+                 TTSMessageDTO(
+                     sentence_id=current_sentence_id,
+@@ -1036,8 +1068,12 @@ class ConnectionHandler:
+                             tool_result=kb_context[:500] if kb_context else None,
+                         )
+                     elif kb_result and kb_result.action == Action.RESPONSE:
++                        # 注意：这条分支只记日志，不设 kb_precheck_failed，
++                        # 所以上面的 kb_failure_mode 兜底不会生效，学生这边表现为
++                        # “没有任何提示地裸答”。是否要一并纳入兜底，见修正说明。
+                         self.logger.bind(tag=TAG).warning(
+-                            f"知识库预查返回异常: {kb_result.response}"
++                            f"知识库预查返回兜底话术: {kb_result.result!r}"
++                            f"（详情见 RAGflow 错误日志）"
+                         )
+                 except Exception as e:
+                     kb_elapsed = (time.time() - kb_start) * 1000
+@@ -1194,6 +1230,38 @@ class ConnectionHandler:
+         content_arguments = ""
+         emotion_flag = True
+         llm_first_token_logged = False  # [LATENCY] 标记是否已记录首token
++
++        # [P0] 工具调用文本防泄漏
++        # 本地模型走 <tool_call>{...} 文本协议时，旧逻辑用
++        # content_arguments.startswith("<tool_call>") 判断；只要模型先吐一个换行
++        # 或一句引导语，startswith 就永久为假，于是整段
++        # {"name": "search_from_ragflow", ...} 被送进 TTS 并显示到字幕。
++        # 现在两道防线：
++        #   1) 标记出现在任何位置都判定为工具调用（不限于开头）；
++        #   2) 流式开头先压着不播，确认不是工具调用再放行，
++        #      避免标记被拆成跨 chunk 时前半个 "<tool_" 漏到字幕。
++        TOOL_CALL_MARKER = "<tool_call>"
++        HOLDBACK_CHARS = len(TOOL_CALL_MARKER) + 8
++        pending_prefix = ""  # 已收到但还没判断出是不是工具调用的开头文本
++        plain_text_confirmed = False  # 已确认是正常回答，之后直接放行
++
++        def emit_tts_text(text):
++            """把确认要播报的文本写入历史并推给 TTS（设备字幕取自 TTS 句子）"""
++            if not text:
++                return
++            response_message.append(text)
++            if self.latency_tts_first_enqueue == 0:
++                self.latency_tts_first_enqueue = time.time()
++            self.tts.tts_text_queue.put(
++                TTSMessageDTO(
++                    sentence_id=current_sentence_id,
++                    sentence_type=SentenceType.MIDDLE,
++                    content_type=ContentType.TEXT,
++                    content_detail=text,
++                    generation=my_generation,
++                )
++            )
++
+         try:
+             for response in llm_responses:
+                 if self.client_abort:
+@@ -1217,8 +1285,9 @@ class ConnectionHandler:
+                     if content is not None and len(content) > 0:
+                         content_arguments += content
+ 
+-                    if not tool_call_flag and content_arguments.startswith("<tool_call>"):
+-                        # print("content_arguments", content_arguments)
++                    # 标记出现在任何位置都算工具调用：这样模型先输出
++                    # “好的，我查一下。<tool_call>{...}” 时，后面的 JSON 也不会被播报
++                    if not tool_call_flag and TOOL_CALL_MARKER in content_arguments:
+                         tool_call_flag = True
+ 
+                     if tools_call is not None and len(tools_call) > 0:
+@@ -1236,20 +1305,28 @@ class ConnectionHandler:
+                     emotion_flag = False
+ 
+                 if content is not None and len(content) > 0:
+-                    if not tool_call_flag:
+-                        response_message.append(content)
+-                        # [LATENCY] 记录首段文本入队时间
+-                        if self.latency_tts_first_enqueue == 0:
+-                            self.latency_tts_first_enqueue = time.time()
+-                        self.tts.tts_text_queue.put(
+-                            TTSMessageDTO(
+-                                sentence_id=current_sentence_id,
+-                                sentence_type=SentenceType.MIDDLE,
+-                                content_type=ContentType.TEXT,
+-                                content_detail=content,
+-                                generation=my_generation,
+-                            )
++                    if tool_call_flag:
++                        # 工具调用内容一律不播报、不上字幕
++                        pending_prefix = ""
++                    elif plain_text_confirmed:
++                        emit_tts_text(content)
++                    else:
++                        # 开头压着不播：确认不是工具调用再放行
++                        pending_prefix += content
++                        verdict = classify_stream_prefix(
++                            pending_prefix, TOOL_CALL_MARKER, HOLDBACK_CHARS
+                         )
++                        if verdict == "tool":
++                            tool_call_flag = True
++                            pending_prefix = ""
++                        elif verdict == "plain":
++                            plain_text_confirmed = True
++                            emit_tts_text(pending_prefix)
++                            pending_prefix = ""
++            # 流式结束：把仍然压着的开头文本放行（此时已确定不是工具调用）
++            if pending_prefix and not tool_call_flag:
++                emit_tts_text(pending_prefix)
++                pending_prefix = ""
+             # [LATENCY] 记录LLM总耗时（无论是正常结束还是break）
+             self.latency_llm_end = time.time()
+             llm_total = (self.latency_llm_end - self.latency_llm_start) * 1000
+@@ -1300,14 +1377,25 @@ class ConnectionHandler:
+                         )
+                     except Exception as e:
+                         bHasError = True
+-                        response_message.append(a)
++                        self.logger.bind(tag=TAG).warning(
++                            f"工具调用解析失败，原文不入对话历史: {e}"
++                        )
+                 else:
+                     bHasError = True
+-                    response_message.append(content_arguments)
++                    self.logger.bind(tag=TAG).warning(
++                        "未从文本中提取到工具调用 JSON，原文不入对话历史"
++                    )
+                 if bHasError:
+                     self.logger.bind(tag=TAG).error(
+                         f"function call error: {content_arguments}"
+                     )
++                    # 解析失败时既不把 JSON 念出来，也不要静默无声
++                    emit_tts_text(
++                        self.config.get(
++                            "tool_call_error_reply",
++                            "这个问题我暂时没查清楚，换个说法再问我一次好吗？",
++                        )
++                    )
+ 
+             if not bHasError and len(tool_calls_list) > 0:
+                 self.logger.bind(tag=TAG).debug(
+diff --git a/xiaozhi-esp32-server/main/xiaozhi-server/core/handle/sendAudioHandle.py b/xiaozhi-esp32-server/main/xiaozhi-server/core/handle/sendAudioHandle.py
+index 3510fd9..8543741 100644
+--- a/xiaozhi-esp32-server/main/xiaozhi-server/core/handle/sendAudioHandle.py
++++ b/xiaozhi-esp32-server/main/xiaozhi-server/core/handle/sendAudioHandle.py
+@@ -337,10 +337,63 @@ async def send_stt_message(conn: "ConnectionHandler", text):
+ 
+ 
+ async def send_display_message(conn: "ConnectionHandler", text):
+-    """发送纯显示消息"""
++    """发送纯显示消息
++
++    注意：此函数发送的是 stt 类型，客户端会把它当作“学生说的话”显示在字幕区。
++    内部状态（工具名、检索进度等）不要走这里，请改用 send_tool_status_message。
++    """
+     message = {
+         "type": "stt",
+         "text": text,
+         "session_id": conn.session_id
+     }
+     await conn.websocket.send(json.dumps(message))
++
++
++# 工具名 → 展示给学生的人话（不是给开发看的）。可在 data/.config.yaml 的
++# tool_status_text 里按键覆盖，键名 _default 是所有工具的兜底。
++DEFAULT_TOOL_STATUS_TEXT = {
++    "search_from_ragflow": "让我查一下资料…",
++    "get_time": "稍等，我看下时间…",
++    "get_weather": "我看看天气…",
++    "get_news_from_chinanews": "我翻一下新闻…",
++    "get_news_from_newsnow": "我翻一下新闻…",
++    "play_music": "我去找首歌…",
++    "handle_exit_intent": "好，那我先退下…",
++    "_default": "让我想想…",
++}
++
++
++def resolve_tool_status_text(conn, name):
++    """把工具名翻译成人话。优先级：config 精确 → 内置精确 → config 兜底 → 内置兜底"""
++    override = {}
++    if conn is not None:
++        override = conn.config.get("tool_status_text") or {}
++    if name in override:
++        return override[name]
++    if name in DEFAULT_TOOL_STATUS_TEXT:
++        return DEFAULT_TOOL_STATUS_TEXT[name]
++    return override.get("_default") or DEFAULT_TOOL_STATUS_TEXT["_default"]
++
++
++async def send_tool_status_message(conn: "ConnectionHandler", name, state="start", text=None):
++    """发送工具调用状态（独立消息类型，不进字幕）
++
++    以前这里发的是 {"type": "stt", "text": "% search_from_ragflow"}，
++    设备端会把 stt 当成用户说的话刷到字幕条上，于是学生看到
++    “% search_from_ragflow” 这种后台信息。
++
++    现在改为独立的 tool 消息类型，并带一句人话（text）：
++    不认识该类型的设备会安全忽略；认识它的就在状态栏显示
++    “让我查一下资料…” 这种提示，既不污染字幕也不像机器。
++    """
++    if text is None:
++        text = resolve_tool_status_text(conn, name)
++    message = {
++        "type": "tool",
++        "state": state,
++        "name": name,
++        "text": text,
++        "session_id": conn.session_id,
++    }
++    await conn.websocket.send(json.dumps(message, ensure_ascii=False))
+diff --git a/xiaozhi-esp32-server/main/xiaozhi-server/core/providers/llm/system_prompt.py b/xiaozhi-esp32-server/main/xiaozhi-server/core/providers/llm/system_prompt.py
+index 606f0e4..24a145c 100644
+--- a/xiaozhi-esp32-server/main/xiaozhi-server/core/providers/llm/system_prompt.py
++++ b/xiaozhi-esp32-server/main/xiaozhi-server/core/providers/llm/system_prompt.py
+@@ -27,7 +27,7 @@ Here's the structure:
+         // Add more parameters as needed, if parameters are required, you must provide them
+     }}
+ }}
+-<tool_call>
++</tool_call>
+ 
+ For example:
+ if you got tool as follow
+diff --git a/xiaozhi-esp32-server/main/xiaozhi-server/core/providers/tools/unified_tool_handler.py b/xiaozhi-esp32-server/main/xiaozhi-server/core/providers/tools/unified_tool_handler.py
+index a5d4c3d..adb6075 100644
+--- a/xiaozhi-esp32-server/main/xiaozhi-server/core/providers/tools/unified_tool_handler.py
++++ b/xiaozhi-esp32-server/main/xiaozhi-server/core/providers/tools/unified_tool_handler.py
+@@ -13,7 +13,7 @@ from .server_mcp import ServerMCPExecutor
+ from .device_iot import DeviceIoTExecutor
+ from .device_mcp import DeviceMCPExecutor
+ from .mcp_endpoint import MCPEndpointExecutor
+-from core.handle.sendAudioHandle import send_display_message
++from core.handle.sendAudioHandle import send_tool_status_message
+ 
+ 
+ class UnifiedToolHandler:
+@@ -168,11 +168,11 @@ class UnifiedToolHandler:
+ 
+             self.logger.debug(f"调用函数: {function_name}, 参数: {arguments}")
+ 
+-            # 发送工具调用显示消息到设备
++            # 发送工具调用状态到设备（独立 tool 消息类型，不会显示到字幕里）
+             try:
+-                await send_display_message(self.conn, f"% {function_name}")
++                await send_tool_status_message(self.conn, function_name, "start")
+             except Exception as e:
+-                self.logger.warning(f"发送工具调用显示消息失败: {e}")
++                self.logger.warning(f"发送工具调用状态消息失败: {e}")
+ 
+             # 执行工具调用
+             result = await self.tool_manager.execute_tool(function_name, arguments)
+diff --git a/xiaozhi-esp32-server/main/xiaozhi-server/core/utils/textUtils.py b/xiaozhi-esp32-server/main/xiaozhi-server/core/utils/textUtils.py
+index 11dee51..f3aeeda 100644
+--- a/xiaozhi-esp32-server/main/xiaozhi-server/core/utils/textUtils.py
++++ b/xiaozhi-esp32-server/main/xiaozhi-server/core/utils/textUtils.py
+@@ -81,6 +81,41 @@ def is_punctuation_or_emoji(char):
+     return is_emoji(char)
+ 
+ 
++async def send_emotion(conn: "ConnectionHandler", emotion: str, emoji: str = ""):
++    """直接指定情绪名发送（不依赖文本内容）
++
++    emotion 必须是固件内置的表情名，见 emoji_collection.cc：
++    neutral/happy/laughing/funny/sad/angry/crying/loving/embarrassed/
++    surprised/shocked/thinking/winking/cool/relaxed/delicious/kissy/
++    confident/sleepy/silly/confused
++    传了固件不认识的名字也不会报错，只是不显示。
++    """
++    try:
++        await conn.websocket.send(
++            json.dumps(
++                {
++                    "type": "llm",
++                    "text": emoji,
++                    "emotion": emotion,
++                    "session_id": conn.session_id,
++                },
++                ensure_ascii=False,
++            )
++        )
++    except Exception as e:
++        conn.logger.bind(tag=TAG).warning(f"发送情绪表情失败，错误:{e}")
++
++
++async def send_thinking(conn: "ConnectionHandler"):
++    """显示"思考中"的表情（🤔）
++
++    学生问完话到第一句回答之间有一段等待（知识库检索 + 大模型首 token），
++    这段时间屏幕上什么都不动，体感很"卡"。先亮一个 🤔，回答一开始就会被
++    get_emotion 的正式情绪覆盖掉。
++    """
++    await send_emotion(conn, "thinking", "🤔")
++
++
+ async def get_emotion(conn: "ConnectionHandler", text):
+     """获取文本内的情绪消息"""
+     emoji = "🙂"
+diff --git a/xiaozhi-esp32-server/main/xiaozhi-server/plugins_func/functions/search_from_ragflow.py b/xiaozhi-esp32-server/main/xiaozhi-server/plugins_func/functions/search_from_ragflow.py
+index 965bc45..9a30a0d 100644
+--- a/xiaozhi-esp32-server/main/xiaozhi-server/plugins_func/functions/search_from_ragflow.py
++++ b/xiaozhi-esp32-server/main/xiaozhi-server/plugins_func/functions/search_from_ragflow.py
+@@ -10,6 +10,16 @@ if TYPE_CHECKING:
+ TAG = __name__
+ logger = setup_logging()
+ 
++# 面向学生的兜底话术：只描述“这次没查到”，绝不透露接口名、错误码、
++# 服务地址或“请检查RAGflow服务状态”这类运维信息——这些内容会被 TTS
++# 念出来并显示在设备字幕上。详细原因只写服务端日志，见 _log_failure。
++STUDENT_FALLBACK_REPLY = "这个知识点我这边暂时没查到，换个说法再问我一次，或者问问现场的老师。"
++
++
++def _log_failure(kind: str, detail: str) -> None:
++    """把接口级细节只写进服务端日志，不再交给 TTS"""
++    logger.bind(tag=TAG).error(f"RAGflow {kind}: {detail}")
++
+ # 定义基础的函数描述模板
+ SEARCH_FROM_RAGFLOW_FUNCTION_DESC = {
+     "type": "function",
+@@ -73,20 +83,13 @@ def search_from_ragflow(conn: "ConnectionHandler", question=None):
+             error_message = result.get("error", {}).get("message", "")
+             error_code = result.get("code", "")
+ 
+-            # 安全地记录错误信息
+-            logger.bind(tag=TAG).error(
+-                f"RAGFlow API调用失败，响应码：{error_code}，错误详情：{error_detail}，完整响应：{result}"
++            # 细节只写日志；返回 Action.RESPONSE 会被 _handle_function_result
++            # 直接拿去 TTS 播报，所以这里只能给学生话术，不能给运维话术
++            _log_failure(
++                "接口返回错误",
++                f"响应码={error_code} 错误信息={error_message} 详情={error_detail}",
+             )
+-
+-            # 构建详细的错误响应
+-            error_response = f"RAG接口返回异常（错误码：{error_code}）"
+-
+-            if error_message:
+-                error_response += f"：{error_message}"
+-            if error_detail:
+-                error_response += f"\n详情：{error_detail}"
+-
+-            return ActionResponse(Action.RESPONSE, None, error_response)
++            return ActionResponse(Action.RESPONSE, None, STUDENT_FALLBACK_REPLY)
+ 
+         chunks = result.get("data", {}).get("chunks", [])
+         contents = []
+@@ -113,56 +116,17 @@ def search_from_ragflow(conn: "ConnectionHandler", question=None):
+         return ActionResponse(Action.REQLLM, context_text, None)
+ 
+     except requests.exceptions.RequestException as e:
+-        # 网络请求异常
++        # 网络请求异常：按类型给出运维排查提示，但全部只进日志
+         error_type = type(e).__name__
+-        logger.bind(tag=TAG).error(
+-            f"RAGflow网络请求失败，异常类型：{error_type}，详情：{str(e)}"
++        status_code = getattr(getattr(e, "response", None), "status_code", None)
++        _log_failure(
++            "网络请求失败",
++            f"异常类型={error_type} 状态码={status_code} 详情={e}",
+         )
+-
+-        # 根据异常类型提供更详细的错误信息和解决方案
+-        if isinstance(e, requests.exceptions.ConnectTimeout):
+-            error_response = "RAG接口连接超时（5秒）"
+-            error_response += "\n可能原因：RAGflow服务未启动或网络连接问题"
+-            error_response += "\n解决方案：请检查RAGflow服务状态和网络连接"
+-
+-        elif isinstance(e, requests.exceptions.ConnectionError):
+-            error_response = "无法连接到RAG接口"
+-            error_response += "\n可能原因：RAGflow服务地址错误或服务未运行"
+-            error_response += "\n解决方案：请检查RAGflow服务地址配置和服务状态"
+-
+-        elif isinstance(e, requests.exceptions.Timeout):
+-            error_response = "RAG接口请求超时"
+-            error_response += "\n可能原因：RAGflow服务响应缓慢或网络延迟"
+-            error_response += "\n解决方案：请稍后重试或检查RAGflow服务性能"
+-
+-        elif isinstance(e, requests.exceptions.HTTPError):
+-            # 处理HTTP错误状态码
+-            if hasattr(e.response, "status_code"):
+-                status_code = e.response.status_code
+-                error_response = f"RAG接口HTTP错误（状态码：{status_code}）"
+-
+-                # 尝试获取响应内容中的错误信息
+-                try:
+-                    error_detail = e.response.json().get("error", {}).get("message", "")
+-                    if error_detail:
+-                        error_response += f"\n错误详情：{error_detail}"
+-                except:
+-                    pass
+-            else:
+-                error_response = f"RAG接口HTTP异常：{str(e)}"
+-
+-        else:
+-            error_response = f"RAG接口网络异常（{error_type}）：{str(e)}"
+-
+-        return ActionResponse(Action.RESPONSE, None, error_response)
++        return ActionResponse(Action.RESPONSE, None, STUDENT_FALLBACK_REPLY)
+ 
+     except Exception as e:
+-        # 其他异常
++        # 其他异常（JSON 解析失败等）
+         error_type = type(e).__name__
+-        logger.bind(tag=TAG).error(
+-            f"RAGflow处理异常，异常类型：{error_type}，详情：{str(e)}"
+-        )
+-
+-        # 提供详细的错误信息
+-        error_response = f"RAG接口处理异常（{error_type}）：{str(e)}"
+-        return ActionResponse(Action.RESPONSE, None, error_response)
++        _log_failure("处理异常", f"异常类型={error_type} 详情={e}")
++        return ActionResponse(Action.RESPONSE, None, STUDENT_FALLBACK_REPLY)
+
